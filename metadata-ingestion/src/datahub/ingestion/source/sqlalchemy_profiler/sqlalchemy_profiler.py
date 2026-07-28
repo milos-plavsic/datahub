@@ -425,12 +425,19 @@ def _format_numeric_value(value: Any, col_type: ProfilerDataType) -> str:
 class SQLAlchemyProfiler:
     """Custom SQLAlchemy-based profiler replacing Great Expectations."""
 
+    # How many tables to name per database in the post-run "most expensive tables" info
+    # entry. times_taken_per_table resets with each per-inspector profiler instance (one per
+    # database — sql_common.py get_profiling_internal), so this is a per-database top-N, not a
+    # global top-N across the whole run. Each context is db.table-qualified (pretty_name), so the
+    # per-database contexts are self-describing and LossyList caps the total.
+    _EXPENSIVE_TABLES_TOP_N = 5
+
     report: SQLSourceReport
     config: ProfilingConfig
     times_taken: List[float]
     # Per-table (pretty_name, time_taken) pairs, accumulated across this profiler instance's
-    # generate_profiles() calls. Used to emit the post-run "most expensive tables" warning
-    # (see _report_expensive_tables). Kept separate from times_taken (List[float]) so the
+    # generate_profiles() calls. Used to emit the post-run "most expensive tables" info
+    # entry (see _report_expensive_tables). Kept separate from times_taken (List[float]) so the
     # percentile calculation at the telemetry ping below is unchanged.
     times_taken_per_table: List[Tuple[str, float]]
     total_row_count: int
@@ -438,6 +445,9 @@ class SQLAlchemyProfiler:
     base_engine: Engine
     platform: str  # passed from parent source config
     env: str
+    # Resolved once at construction (see __init__); the per-table path re-applies it to each
+    # checked-out connection. None means stay transactional.
+    _profiling_isolation_level: Optional[str]
 
     def __init__(
         self,
@@ -480,13 +490,14 @@ class SQLAlchemyProfiler:
 
         # Resolve the profiling isolation level ONCE here, not per table. The level is
         # adapter-constant and (via the escape hatch) config-constant, so resolving it per
-        # table was wasted work — and worse, it was resolved inside the per-table try at
-        # sqlalchemy_profiler.py:1601 whose handler (:1816) catches sa.exc.SQLAlchemyError.
-        # ArgumentError subclasses SQLAlchemyError, so a bad level was swallowed into one
-        # warning per table and returned None — zero profiles for the entire run, silently.
-        # Validating here fails loudly at construction instead. Keep the execution_options
-        # *call* itself inside the per-table connection scope (it must apply to each checked-out
-        # connection); only resolution and validation are hoisted.
+        # table was wasted work — and worse, it was resolved inside the per-table try in
+        # _generate_single_profile whose handler catches sa.exc.SQLAlchemyError. ArgumentError
+        # subclasses SQLAlchemyError, so a bad level was swallowed into one warning per table
+        # and returned None — zero profiles for the entire run, silently. Resolving+validating
+        # here fails loudly at construction instead — BUT only for config-supplied levels (see
+        # below). The execution_options *call* itself stays in the per-table connection scope
+        # (it must apply to each checked-out connection); only resolution and validation are
+        # hoisted.
         adapter = get_adapter(platform, self.config, self.report, self.base_engine)
         level = adapter.profiling_isolation_level()
         # Escape hatch (config overrides the adapter in both directions): force a level, or
@@ -495,13 +506,38 @@ class SQLAlchemyProfiler:
         override = self.config.profiling_isolation_level
         if override is not None:
             level = None if override == "TRANSACTIONAL" else override
-        if level is not None:
-            # execution_options(isolation_level=...) validates the name against the dialect
-            # eagerly (raises ArgumentError on an unknown name — verified on SQLAlchemy 1.4).
-            # One connect/apply/close here is the single eager validation; the per-table path
-            # only re-applies the already-validated level.
-            with self.base_engine.connect() as conn:
-                conn.execution_options(isolation_level=level)
+            # Only a user-supplied level needs eager validation: a typo here would otherwise be
+            # swallowed by the per-table handler (which catches SQLAlchemyError, and ArgumentError
+            # subclasses it), producing one warning per table and zero profiles for the whole run.
+            # Adapter-returned levels are code-controlled and asserted in test_adapters.py, so
+            # the common path does no I/O at construction — get_profiler_instance is called once
+            # per database and is not wrapped in a try, so a transient blip here would abort
+            # ingestion. Lookup-based validation does NOT work (the dialect's _isolation_lookup
+            # varies in type and is not consistently populated — mssql omits AUTOCOMMIT despite
+            # supporting it; and on some dialects the attribute is a lazy property that imports
+            # the driver, so merely reading it can raise ModuleNotFoundError in an env where the
+            # dialect is registered but the driver isn't installed), so a real connection is the
+            # only reliable check.
+            #
+            # Narrowed guarantee: adapter-returned levels are NOT pre-flighted. If the DB rejects
+            # an adapter-returned level at SET time (e.g. MySQL behind a proxy that rejects
+            # AUTOCOMMIT), execution_options raises per table into the per-table handler — one
+            # warning per table, zero profiles. The per-table wrapper around execution_options
+            # emits a distinct entry naming `profiling_isolation_level: TRANSACTIONAL` as the
+            # remedy so the operator isn't left with a generic "Failed to extract statistics"
+            # warning. That is the failure shape the original hoisting existed to prevent,
+            # reached by a different trigger; the trade-off is no I/O in the common path.
+            if level is not None:
+                try:
+                    with self.base_engine.connect() as validation_conn:
+                        validation_conn.execution_options(isolation_level=level)
+                except sa.exc.ArgumentError:
+                    raise  # bad config — fail loudly, this is the point
+                except sa.exc.SQLAlchemyError as e:
+                    logger.warning(
+                        f"Could not pre-validate profiling isolation level {level!r}: {e}. "
+                        "The level will still be applied per table."
+                    )
         self._profiling_isolation_level = level
 
     def _get_columns_to_profile(self, table: sa.Table, dataset_name: str) -> List[str]:
@@ -1131,10 +1167,6 @@ class SQLAlchemyProfiler:
 
         self._report_expensive_tables()
 
-    # How many tables to name in the post-run "most expensive tables" warning. Bounded so the
-    # warning stays one short, actionable line regardless of how many tables were profiled.
-    _EXPENSIVE_TABLES_TOP_N = 5
-
     def _report_expensive_tables(self) -> None:
         # Discoverability mechanism for sources that default to no row/size guardrail (e.g. MySQL):
         # name the few tables that took the longest to profile so an operator can see the real
@@ -1142,7 +1174,22 @@ class SQLAlchemyProfiler:
         # run path (here), NOT in generate_profile_candidates — which is dead by default when the
         # limits are None, so anything placed there would never fire for the users who need it.
         # Gated on a config flag (default off; MySQL opts in) and independent of whether a limit
-        # is configured, so the warning and the skip counters behave independently.
+        # is configured, so the info entry and the skip counters behave independently.
+        #
+        # Uses report.info (not report.warning): nothing is wrong, and report.warning counts
+        # toward --strict-warnings failure (run/pipeline.py pretty_print_summary). Emitted at
+        # info level so it surfaces in the report without breaking CI runs.
+        #
+        # message is a constant literal and the formatted table list goes in context= so that
+        # StructuredLogs.report_log (api/source.py:148) dedupes on f"{title}-{message}" — all
+        # databases on a multi-database server group under ONE entry with one context per call,
+        # rather than N entries (one per database, since get_profiling_internal constructs a fresh
+        # profiler per database — sql_common.py:596-599). message is also LiteralString by
+        # convention (teradata.py:1852 etc.).
+        #
+        # Generator caveat: generate_profiles is a generator, so this only runs on full
+        # consumption — the info entry vanishes if the pipeline stops early. Same pre-existing
+        # caveat as the telemetry ping immediately above this call; not introduced here.
         if not self.config.report_expensive_tables:
             return
         if not self.times_taken_per_table:
@@ -1151,14 +1198,14 @@ class SQLAlchemyProfiler:
             self.times_taken_per_table, key=lambda pair: pair[1], reverse=True
         )[: self._EXPENSIVE_TABLES_TOP_N]
         formatted = ", ".join(f"{name} ({t:.1f}s)" for name, t in top)
-        self.report.warning(
+        self.report.info(
             title="Profiling: expensive tables",
             message=(
-                "These tables took the longest to profile. If this is too slow or risks "
+                "These tables took the longest to profile. If profiling is too slow or risks "
                 "OOM, set `profiling.profile_table_row_limit` and/or "
-                "`profiling.profile_table_size_limit` to skip large tables: "
-                + formatted
+                "`profiling.profile_table_size_limit` to skip large tables."
             ),
+            context=formatted,
         )
 
     def _generate_profile_from_request(
@@ -1671,9 +1718,36 @@ class SQLAlchemyProfiler:
                         # copy carrying the new option rather than mutating in place, so the
                         # returned object is the one that must flow downstream into
                         # adapter.setup_profiling(context, conn). Do NOT drop the rebind.
-                        conn = conn.execution_options(
-                            isolation_level=self._profiling_isolation_level
-                        )
+                        try:
+                            conn = conn.execution_options(
+                                isolation_level=self._profiling_isolation_level
+                            )
+                        except sa.exc.ArgumentError:
+                            # Bad level name. Config-override typos are caught at construction,
+                            # so reaching here means an adapter returned an unsupported level —
+                            # a code bug asserted in test_adapters.py. Fail loudly.
+                            raise
+                        except sa.exc.SQLAlchemyError as e:
+                            # The DB rejected the session setting at SET time — e.g. MySQL
+                            # behind a proxy that rejects AUTOCOMMIT. Adapter-returned levels
+                            # are not pre-flighted at construction (only config overrides are),
+                            # so this surfaces here, per table. Emit a distinct entry naming
+                            # the remedy so the operator isn't left with a generic
+                            # "Failed to extract statistics" warning per table.
+                            self.report.warning(
+                                title="Profiling isolation level rejected",
+                                message=(
+                                    f"The database rejected profiling isolation level "
+                                    f"{self._profiling_isolation_level!r}. Set "
+                                    f"`profiling.profiling_isolation_level: TRANSACTIONAL` on "
+                                    f"the source to profile under the default transactional "
+                                    f"behavior instead."
+                                ),
+                                context=f"{pretty_name}: {type(e).__name__}: {str(e)}",
+                            )
+                            if not self.config.catch_exceptions:
+                                raise
+                            return None
                     # Setup profiling using platform adapter
                     # This handles temp tables, sampling, and creates sql_table
                     try:
