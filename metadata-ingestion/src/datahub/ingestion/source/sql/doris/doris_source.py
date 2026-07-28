@@ -1,4 +1,5 @@
 import logging
+import os
 import re
 from typing import Any, Dict, Iterable, List
 
@@ -16,7 +17,6 @@ from datahub.ingestion.api.decorators import (
     platform_name,
     support_status,
 )
-from datahub.ingestion.source.ge_profiling_config import GEProfilingConfig
 from datahub.ingestion.source.sql.doris.doris_dialect import (
     AGG_STATE,
     BITMAP,
@@ -27,7 +27,11 @@ from datahub.ingestion.source.sql.doris.doris_dialect import (
     HLL,
     QUANTILE_STATE,
 )
-from datahub.ingestion.source.sql.mysql import MySQLConfig, MySQLSource
+from datahub.ingestion.source.sql.mysql import (
+    MySQLConfig,
+    MySQLProfilingConfig,
+    MySQLSource,
+)
 from datahub.ingestion.source.sql.sql_common import register_custom_type
 from datahub.ingestion.source.sql.stored_procedures.base import BaseProcedure
 from datahub.metadata.schema_classes import (
@@ -55,6 +59,34 @@ register_custom_type(DORIS_STRUCT, RecordTypeClass)
 register_custom_type(DORIS_JSONB, RecordTypeClass)
 
 
+class DorisProfilingConfig(MySQLProfilingConfig):
+    # Doris extends MySQLConfig (MySQL-protocol-compatible driver/information_schema), so it
+    # inherits MySQLConfig's narrowed `profiling: MySQLProfilingConfig` type. Doris is an MPP
+    # columnar engine, not a single-primary row store, so two of MySQL's overrides don't fit and
+    # are reverted to the shared GEProfilingConfig default:
+    #   - max_workers=5 is a ~40→5 throughput regression for a reason (single-primary contention)
+    #     that doesn't hold for Doris's MPP execution.
+    #   - report_expensive_tables=True recommends setting *MySQL* row limits, which is odd advice
+    #     for Doris.
+    # The two limit fields are deliberately NOT redeclared: they inherit MySQLProfilingConfig's
+    # `None` default. That is what preserves prior behavior — PR 2 newly implements
+    # generate_profile_candidates (the enforcement mechanism) for the MySQL family, so a non-None
+    # default here would *activate* a guardrail that never ran before, silently dropping profiles
+    # for tables over 5M rows using information_schema.tables.table_rows semantics that Doris
+    # (an MPP engine) does not share with InnoDB. Same failure mode rejected for MySQL in §4.1.
+    # The inherited field keeps its Annotated[Optional[int], SupportedSources(["mysql"])] type, so
+    # `null` is still accepted and the SupportedSources metadata survives (verified in
+    # test_doris_and_tidb_inherited_limit_fields_keep_optional_and_supported_sources).
+    max_workers: int = Field(
+        default=5 * (os.cpu_count() or 4),
+        description="Number of worker threads to use for profiling. Set to 1 to disable.",
+    )
+    report_expensive_tables: bool = Field(
+        default=False,
+        description="Emit a post-run report.warning naming the few tables that took the longest to profile.",
+    )
+
+
 class DorisConfig(MySQLConfig):
     scheme: HiddenFromDocs[str] = Field(default="doris+pymysql")
 
@@ -71,8 +103,8 @@ class DorisConfig(MySQLConfig):
         description=f"Doris FE (Frontend) host and port. Default port is {DORIS_DEFAULT_PORT}.",
     )
 
-    profiling: GEProfilingConfig = Field(
-        default_factory=GEProfilingConfig,
+    profiling: DorisProfilingConfig = Field(
+        default_factory=DorisProfilingConfig,
         description=(
             "Configuration for profiling Doris tables. "
             "Note: Doris types (HLL, BITMAP, QUANTILE_STATE, ARRAY, JSONB) are automatically "
