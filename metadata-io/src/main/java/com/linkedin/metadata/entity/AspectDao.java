@@ -248,6 +248,16 @@ public interface AspectDao {
   @Nonnull
   Integer countAspect(OperationContext operationContext, final RestoreIndicesArgs args);
 
+  /**
+   * Whether {@link #streamAspectBatches(OperationContext, RestoreIndicesArgs)} can actually
+   * enumerate rows on this implementation. Cassandra returns a silent empty stream, so callers that
+   * derive completeness claims from the scan (e.g. backfills writing a completion marker) must
+   * check this first instead of mistaking an empty scan for full coverage.
+   */
+  default boolean supportsRestoreIndicesScan() {
+    return true;
+  }
+
   @Nonnull
   PartitionedStream<EbeanAspectV2> streamAspectBatches(
       @Nonnull OperationContext opContext, @Nonnull final RestoreIndicesArgs args);

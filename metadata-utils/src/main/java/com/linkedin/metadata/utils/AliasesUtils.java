@@ -7,6 +7,14 @@ import java.util.Locale;
 
 public class AliasesUtils {
 
+  /**
+   * Upgrade id whose SUCCEEDED marker means every dataset carries an {@code aliases} aspect;
+   * case-insensitive resolution must gate on it, since partial coverage mis-resolves collisions.
+   * Bump the {@code -vN} suffix in any change to {@link #lowercaseDatasetUrn} to force
+   * recomputation.
+   */
+  public static final String DATASET_ALIASES_BACKFILL_UPGRADE_ID = "dataset-aliases-v1";
+
   private AliasesUtils() {}
 
   /**

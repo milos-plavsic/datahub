@@ -374,6 +374,14 @@ public class CassandraAspectDaoTest {
   }
 
   @Test
+  public void testRestoreIndicesScanUnsupported() {
+    // streamAspectBatches is a silent empty-stream stub on Cassandra; consumers like the
+    // dataset-aliases backfill must be able to detect this rather than mistake an empty
+    // scan for full coverage.
+    assertFalse(testDao.supportsRestoreIndicesScan());
+  }
+
+  @Test
   public void testWriteOperationsReturnEmptyWhenNotWritable() {
     testDao.setWritable(false);
 
