@@ -70,11 +70,11 @@ import lombok.extern.slf4j.Slf4j;
  * older image without the side effect can therefore leave gaps; {@code
  * systemUpdate.datasetAliases.reprocess.enabled} forces a full re-scan and repair for that case.
  *
- * <p>Coverage means both stores, so the checkpoint carries two urn boundaries: {@link
- * #LAST_URN_KEY}, through which MCL production is confirmed, and {@link #ATTEMPTED_URN_KEY}, the
- * page that was mid-write. A crash between SQL commit and Kafka produce leaves rows that read back
- * as matched but never reached Elasticsearch, and no rewrite can dislodge them — the second
- * boundary is what lets a resume re-emit their MCLs instead of skipping them forever.
+ * <p>Coverage means both stores. A crash between SQL commit and Kafka produce leaves rows that read
+ * back as matched but never reached Elasticsearch, and no rewrite can dislodge them (an identical
+ * value is no-op'd with its MCL suppressed). So any resumed run re-emits MCLs for every matched row
+ * it encounters for the rest of the scan: re-emission is idempotent and one Kafka produce per row,
+ * far cheaper than tracking how far the dead run's writes got.
  */
 @Slf4j
 public class BackfillDatasetAliasesStep implements UpgradeStep {
@@ -85,16 +85,12 @@ public class BackfillDatasetAliasesStep implements UpgradeStep {
    */
   public static final String UPGRADE_ID = AliasesUtils.DATASET_ALIASES_BACKFILL_UPGRADE_ID;
 
-  /** Checkpoint key: urn boundary of the last fully confirmed page. */
-  public static final String LAST_URN_KEY = "lastUrn";
-
   /**
-   * Checkpoint key: urn boundary of the page whose writes were in flight when the checkpoint was
-   * taken. Rows at or before it may have committed to SQL without their MCL reaching Kafka, so a
-   * resume must re-emit MCLs across that window rather than trusting the stored value. Empty once
-   * the window is confirmed closed.
+   * Checkpoint key: urn boundary of the last fully confirmed page — written to SQL and its MCL
+   * production confirmed. Written before each page's writes go out, so any interrupted run leaves
+   * an IN_PROGRESS row behind and the resume knows to re-emit MCLs for matched rows past it.
    */
-  public static final String ATTEMPTED_URN_KEY = "attemptedUrn";
+  public static final String LAST_URN_KEY = "lastUrn";
 
   private static final String DATASET_URN_LIKE = "urn:li:" + DATASET_ENTITY_NAME + ":%";
 
@@ -197,20 +193,17 @@ public class BackfillDatasetAliasesStep implements UpgradeStep {
               .map(DataHubUpgradeResult::getResult);
 
       String lastUrn = resumeState.map(state -> state.getOrDefault(LAST_URN_KEY, "")).orElse("");
-      // Rows at or before this boundary were written by a run that died before confirming their
-      // MCLs. They read back as matched, and a plain rewrite cannot fix them (an identical value is
-      // no-op'd with its MCL suppressed), so they need unconditional re-emission. Deriving the
-      // window from the page shape instead would be unsound: datasets created inside the crashed
-      // page's urn range shift the boundary, leaving unconfirmed rows past the resumed page.
-      String repairThroughUrn =
-          resumeState.map(state -> state.getOrDefault(ATTEMPTED_URN_KEY, "")).orElse("");
-      boolean repairing = !repairThroughUrn.isEmpty();
-      if (!lastUrn.isEmpty() || repairing) {
+      // The interrupted run may have committed rows past the confirmed boundary without their MCL
+      // reaching Kafka. Those rows read back as matched, and a plain rewrite cannot fix them (an
+      // identical value is no-op'd with its MCL suppressed), so a resumed run re-emits MCLs for
+      // every matched row for the rest of the scan. Re-emission is idempotent and cheap; matched
+      // rows past the crash point are rare at backfill time, so no window tracking is worth it.
+      boolean repairing = resumeState.isPresent();
+      if (repairing) {
         log.info(
-            "{}: Resuming from URN: {}{}",
+            "{}: Resuming from URN: {}, re-emitting MCLs for matched rows",
             getUpgradeIdUrn(),
-            lastUrn.isEmpty() ? "<start>" : lastUrn,
-            repairing ? ", re-emitting MCLs through " + repairThroughUrn : "");
+            lastUrn.isEmpty() ? "<start>" : lastUrn);
       }
 
       RunStats stats = new RunStats();
@@ -225,20 +218,13 @@ public class BackfillDatasetAliasesStep implements UpgradeStep {
         }
         String pageEndUrn = page.get(page.size() - 1).getUrn();
 
-        // Checkpoint before writing, not after: this records the urn window whose SQL commit may
-        // outrun its Kafka produce. lastUrn still names the previous page, so a crash re-reads this
-        // page in full and repairs it. The confirmed boundary advances on the next iteration's
-        // checkpoint, or is dropped outright by the completion marker.
-        saveCheckpoint(context, lastUrn, pageEndUrn);
+        // Checkpoint before writing, not after: lastUrn still names the previous page, so a crash
+        // mid-page leaves an IN_PROGRESS row that makes the resume re-read this page and re-emit
+        // MCLs for its committed-but-unconfirmed rows. The confirmed boundary advances on the next
+        // iteration's checkpoint, or is dropped outright by the completion marker.
+        saveCheckpoint(context, lastUrn);
 
         processPage(page, repairing, stats);
-
-        // The window is closed once a confirmed page reaches it. Comparing urns lexicographically
-        // may disagree with the store's collation at the margin; erring toward one extra repaired
-        // page is harmless, since re-emission is idempotent.
-        if (repairing && pageEndUrn.compareTo(repairThroughUrn) >= 0) {
-          repairing = false;
-        }
         totalRows += page.size();
 
         if (pageEndUrn.equals(lastUrn)) {
@@ -270,8 +256,8 @@ public class BackfillDatasetAliasesStep implements UpgradeStep {
       if (stoppedByLimit) {
         // Deliberately partial (canary/test runs): leave the IN_PROGRESS checkpoint, never the
         // marker — a row-capped scan must not be mistakable for total coverage. The final page is
-        // confirmed at this point, so close the repair window before handing off to the next run.
-        saveCheckpoint(context, lastUrn, "");
+        // confirmed at this point, so advance the boundary before handing off to the next run.
+        saveCheckpoint(context, lastUrn);
         log.warn(
             "{}: stopped after {} rows due to configured limit ({}); coverage is partial and no "
                 + "completion marker was written.",
@@ -334,9 +320,9 @@ public class BackfillDatasetAliasesStep implements UpgradeStep {
    * until every MCL is confirmed produced — the caller's confirmed boundary must imply Kafka
    * durability.
    *
-   * @param repairMode true while the page falls inside a previous run's unconfirmed window, where a
-   *     matched row proves nothing about Elasticsearch and so gets an unconditional MCL re-emission
-   *     on top of the usual classification
+   * @param repairMode true when this run resumed an interrupted one, where a matched row proves
+   *     nothing about Elasticsearch and so gets an unconditional MCL re-emission on top of the
+   *     usual classification
    */
   private void processPage(List<EbeanAspectV2> page, boolean repairMode, RunStats stats) {
     Map<String, DatasetUrn> expectedByUrn = new HashMap<>();
@@ -448,11 +434,9 @@ public class BackfillDatasetAliasesStep implements UpgradeStep {
 
   /**
    * @param lastUrn urn boundary through which MCL production is confirmed
-   * @param attemptedUrn urn boundary of the page being written, or empty when nothing is in flight
    */
-  private void saveCheckpoint(UpgradeContext context, String lastUrn, String attemptedUrn) {
-    log.info(
-        "{}: Saving state. Last urn:{} attempted:{}", getUpgradeIdUrn(), lastUrn, attemptedUrn);
+  private void saveCheckpoint(UpgradeContext context, String lastUrn) {
+    log.info("{}: Saving state. Last urn:{}", getUpgradeIdUrn(), lastUrn);
     context
         .upgrade()
         .setUpgradeResult(
@@ -460,7 +444,7 @@ public class BackfillDatasetAliasesStep implements UpgradeStep {
             getUpgradeIdUrn(),
             entityService,
             DataHubUpgradeState.IN_PROGRESS,
-            Map.of(LAST_URN_KEY, lastUrn, ATTEMPTED_URN_KEY, attemptedUrn));
+            Map.of(LAST_URN_KEY, lastUrn));
   }
 
   private SystemMetadata backfillSystemMetadata() {
