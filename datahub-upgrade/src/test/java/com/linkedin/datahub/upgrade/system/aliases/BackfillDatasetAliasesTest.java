@@ -24,14 +24,9 @@ public class BackfillDatasetAliasesTest {
   }
 
   @Test
-  public void testIdIsStableForNonBlockingFilter() {
-    // the -n handle: datahub-upgrade -u SystemUpdateNonBlocking -n BackfillDatasetAliases
-    assertEquals(buildUpgrade(true).id(), "BackfillDatasetAliases");
-  }
-
-  @Test
   public void testEnabledRegistersStep() {
     BackfillDatasetAliases upgrade = buildUpgrade(true);
+    assertEquals(upgrade.id(), "BackfillDatasetAliases");
     assertEquals(upgrade.steps().size(), 1);
     assertEquals(upgrade.steps().get(0).id(), "dataset-aliases-v1");
   }
