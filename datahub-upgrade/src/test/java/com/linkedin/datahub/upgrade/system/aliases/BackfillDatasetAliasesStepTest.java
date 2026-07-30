@@ -1,5 +1,6 @@
 package com.linkedin.datahub.upgrade.system.aliases;
 
+import static com.linkedin.datahub.upgrade.system.AbstractMCLStep.LAST_URN_KEY;
 import static com.linkedin.metadata.Constants.ALIASES_ASPECT_NAME;
 import static com.linkedin.metadata.Constants.APP_SOURCE;
 import static com.linkedin.metadata.Constants.ASPECT_LATEST_VERSION;
@@ -94,7 +95,10 @@ public class BackfillDatasetAliasesStepTest {
     when(okResult.getMclFuture()).thenReturn(CompletableFuture.completedFuture(null));
     when(mockEntityService.ingestAspects(
             any(OperationContext.class), any(AspectsBatch.class), eq(true), eq(true)))
-        .thenReturn(List.of(okResult));
+        .thenAnswer(
+            invocation ->
+                ((AspectsBatch) invocation.getArgument(1))
+                    .getMCPItems().stream().map(item -> okResult).collect(Collectors.toList()));
   }
 
   private BackfillDatasetAliasesStep buildStep(int batchSize, int limit, boolean reprocessEnabled) {
@@ -281,10 +285,9 @@ public class BackfillDatasetAliasesStepTest {
             any(),
             eq(DataHubUpgradeState.IN_PROGRESS),
             checkpointCaptor.capture());
+    assertEquals(checkpointCaptor.getAllValues().get(0).get(LAST_URN_KEY), "");
     assertEquals(
-        checkpointCaptor.getAllValues().get(0).get(BackfillDatasetAliasesStep.LAST_URN_KEY), "");
-    assertEquals(
-        checkpointCaptor.getAllValues().get(1).get(BackfillDatasetAliasesStep.LAST_URN_KEY),
+        checkpointCaptor.getAllValues().get(1).get(LAST_URN_KEY),
         "urn:li:dataset:(urn:li:dataPlatform:mysql,db.b,PROD)");
   }
 
@@ -313,7 +316,7 @@ public class BackfillDatasetAliasesStepTest {
             checkpointCaptor.capture());
     // the handoff advances the boundary past the confirmed page
     assertEquals(
-        checkpointCaptor.getAllValues().get(1).get(BackfillDatasetAliasesStep.LAST_URN_KEY),
+        checkpointCaptor.getAllValues().get(1).get(LAST_URN_KEY),
         "urn:li:dataset:(urn:li:dataPlatform:mysql,db.b,PROD)");
     verify(mockUpgrade, never())
         .setUpgradeResult(
@@ -355,9 +358,7 @@ public class BackfillDatasetAliasesStepTest {
     String m3 = "urn:li:dataset:(urn:li:dataPlatform:mysql,db.m3,PROD)";
     String fresh = "urn:li:dataset:(urn:li:dataPlatform:mysql,db.m4,PROD)";
 
-    mockPreviousResult(
-        DataHubUpgradeState.IN_PROGRESS,
-        Map.of(BackfillDatasetAliasesStep.LAST_URN_KEY, confirmedUrn));
+    mockPreviousResult(DataHubUpgradeState.IN_PROGRESS, Map.of(LAST_URN_KEY, confirmedUrn));
 
     when(mockAspectDao.streamAspectBatches(
             any(OperationContext.class), any(RestoreIndicesArgs.class)))
@@ -388,9 +389,85 @@ public class BackfillDatasetAliasesStepTest {
     assertTrue(reemitted.contains(m2));
     assertTrue(reemitted.contains(m3));
     assertFalse(reemitted.contains(fresh));
+
+    ArgumentCaptor<AspectsBatch> batchCaptor = ArgumentCaptor.forClass(AspectsBatch.class);
+    verify(mockEntityService, times(1))
+        .ingestAspects(any(OperationContext.class), batchCaptor.capture(), eq(true), eq(true));
+    assertEquals(batchCaptor.getValue().getMCPItems().size(), 1);
+    assertEquals(batchCaptor.getValue().getMCPItems().get(0).getUrn().toString(), fresh);
   }
 
   // ── executable: failure and edge handling ─────────────────────────────────
+
+  @Test
+  public void testEmptyStoreStillWritesMarker() {
+    // zero datasets (fresh install): the scan exhausts immediately and the marker must still be
+    // written, or resolution would never activate
+    when(mockAspectDao.streamAspectBatches(
+            any(OperationContext.class), any(RestoreIndicesArgs.class)))
+        .thenReturn(page());
+
+    UpgradeStepResult result = buildStep(10, 0, false).executable().apply(mockContext);
+    assertEquals(result.result(), DataHubUpgradeState.SUCCEEDED);
+
+    verify(mockEntityService, never())
+        .ingestAspects(any(OperationContext.class), any(AspectsBatch.class), eq(true), eq(true));
+    verify(mockUpgrade)
+        .setUpgradeResult(
+            any(OperationContext.class),
+            any(Urn.class),
+            any(),
+            eq(DataHubUpgradeState.SUCCEEDED),
+            eq(null));
+  }
+
+  @Test
+  public void testCorruptStoredAliasesIsRewrittenNotStuck() {
+    // an unreadable stored row must be rewritten, not fail the page on every retry forever
+    when(mockAspectDao.streamAspectBatches(
+            any(OperationContext.class), any(RestoreIndicesArgs.class)))
+        .thenReturn(page(keyRow(URN_MATCHED)));
+    EntityAspect corrupt =
+        EntityAspect.builder()
+            .urn(URN_MATCHED)
+            .aspect(ALIASES_ASPECT_NAME)
+            .version(ASPECT_LATEST_VERSION)
+            .metadata("{not json")
+            .build();
+    when(mockAspectDao.batchGet(any(OperationContext.class), any(), eq(false)))
+        .thenReturn(Map.of(aliasesKey(URN_MATCHED), corrupt));
+
+    UpgradeStepResult result = buildStep(10, 0, false).executable().apply(mockContext);
+    assertEquals(result.result(), DataHubUpgradeState.SUCCEEDED);
+
+    ArgumentCaptor<AspectsBatch> batchCaptor = ArgumentCaptor.forClass(AspectsBatch.class);
+    verify(mockEntityService, times(1))
+        .ingestAspects(any(OperationContext.class), batchCaptor.capture(), eq(true), eq(true));
+    assertEquals(batchCaptor.getValue().getMCPItems().get(0).getUrn().toString(), URN_MATCHED);
+  }
+
+  @Test
+  public void testDroppedWriteFailsPageAndNoMarker() {
+    // without a request context, validation failures are dropped instead of thrown; the step must
+    // fail the page rather than let the marker cover a row that was never written
+    when(mockAspectDao.streamAspectBatches(
+            any(OperationContext.class), any(RestoreIndicesArgs.class)))
+        .thenReturn(page(keyRow(URN_MISSING)));
+    when(mockEntityService.ingestAspects(
+            any(OperationContext.class), any(AspectsBatch.class), eq(true), eq(true)))
+        .thenReturn(List.of());
+
+    expectThrows(
+        IllegalStateException.class, () -> buildStep(10, 0, false).executable().apply(mockContext));
+
+    verify(mockUpgrade, never())
+        .setUpgradeResult(
+            any(OperationContext.class),
+            any(Urn.class),
+            any(),
+            eq(DataHubUpgradeState.SUCCEEDED),
+            any());
+  }
 
   @Test
   public void testUnparseableUrnSkippedAndRunStillCompletes() {
@@ -488,7 +565,7 @@ public class BackfillDatasetAliasesStepTest {
             any(),
             eq(DataHubUpgradeState.IN_PROGRESS),
             checkpointCaptor.capture());
-    assertEquals(checkpointCaptor.getValue().get(BackfillDatasetAliasesStep.LAST_URN_KEY), "");
+    assertEquals(checkpointCaptor.getValue().get(LAST_URN_KEY), "");
 
     // and never a completion marker off a failed page
     verify(mockUpgrade, never())

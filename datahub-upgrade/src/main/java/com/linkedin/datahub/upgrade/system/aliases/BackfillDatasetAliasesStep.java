@@ -1,5 +1,6 @@
 package com.linkedin.datahub.upgrade.system.aliases;
 
+import static com.linkedin.datahub.upgrade.system.AbstractMCLStep.LAST_URN_KEY;
 import static com.linkedin.metadata.Constants.ALIASES_ASPECT_NAME;
 import static com.linkedin.metadata.Constants.APP_SOURCE;
 import static com.linkedin.metadata.Constants.ASPECT_LATEST_VERSION;
@@ -8,6 +9,7 @@ import static com.linkedin.metadata.Constants.DATASET_KEY_ASPECT_NAME;
 import static com.linkedin.metadata.Constants.SYSTEM_UPDATE_SOURCE;
 
 import com.datahub.util.RecordUtils;
+import com.datahub.util.exception.ModelConversionException;
 import com.linkedin.common.Aliases;
 import com.linkedin.common.urn.DatasetUrn;
 import com.linkedin.common.urn.Urn;
@@ -51,6 +53,7 @@ import java.util.concurrent.Future;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
 import lombok.extern.slf4j.Slf4j;
 
 /**
@@ -67,9 +70,6 @@ public class BackfillDatasetAliasesStep implements UpgradeStep {
 
   /** The {@code -vN} suffix is the lowercasing-rule version; bump it when the rule changes. */
   public static final String UPGRADE_ID = AliasesUtils.DATASET_ALIASES_BACKFILL_UPGRADE_ID;
-
-  /** Checkpoint key: urn boundary through which writes and MCL production are confirmed. */
-  public static final String LAST_URN_KEY = "lastUrn";
 
   private static final String DATASET_URN_LIKE = "urn:li:" + DATASET_ENTITY_NAME + ":%";
 
@@ -306,8 +306,7 @@ public class BackfillDatasetAliasesStep implements UpgradeStep {
           existing.get(
               new EntityAspectIdentifier(rawUrn, ALIASES_ASPECT_NAME, ASPECT_LATEST_VERSION));
 
-      Aliases storedAliases =
-          stored == null ? null : RecordUtils.toRecordTemplate(Aliases.class, stored.getMetadata());
+      Aliases storedAliases = parseStoredAliases(stored, rawUrn);
       boolean matched =
           storedAliases != null
               && storedAliases.hasLowercasedUrn()
@@ -362,6 +361,14 @@ public class BackfillDatasetAliasesStep implements UpgradeStep {
               .items(toWrite)
               .build(opContext);
       List<UpdateAspectResult> results = entityService.ingestAspects(opContext, batch, true, true);
+      if (results.size() < toWrite.size()) {
+        // Without a request context, validation failures are logged and dropped instead of thrown;
+        // a dropped row must fail the page, or the marker would falsely cover it.
+        throw new IllegalStateException(
+            String.format(
+                "%s: %d of %d writes dropped by validation",
+                id(), toWrite.size() - results.size(), toWrite.size()));
+      }
       for (UpdateAspectResult result : results) {
         if (result.getMclFuture() != null) {
           futures.add(result.getMclFuture());
@@ -373,9 +380,26 @@ public class BackfillDatasetAliasesStep implements UpgradeStep {
     for (Future<?> future : futures) {
       try {
         future.get();
-      } catch (InterruptedException | ExecutionException e) {
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new RuntimeException(String.format("%s: MCL production not confirmed", id()), e);
+      } catch (ExecutionException e) {
         throw new RuntimeException(String.format("%s: MCL production not confirmed", id()), e);
       }
+    }
+  }
+
+  /** Corrupt stored JSON is treated as missing, so the row is rewritten with the correct value. */
+  @Nullable
+  private Aliases parseStoredAliases(@Nullable EntityAspect stored, String urn) {
+    if (stored == null || stored.getMetadata() == null) {
+      return null;
+    }
+    try {
+      return RecordUtils.toRecordTemplate(Aliases.class, stored.getMetadata());
+    } catch (ModelConversionException e) {
+      log.warn("{}: rewriting unreadable stored aliases for {}", id(), urn);
+      return null;
     }
   }
 
