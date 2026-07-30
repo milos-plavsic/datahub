@@ -253,6 +253,7 @@ public interface AspectDao {
    * on this implementation. Cassandra returns a silent empty stream, so callers deriving
    * completeness claims from the scan must check this first.
    */
+  @OperationContextExempt(reason = "Returns static config, no request context needed")
   default boolean supportsRestoreIndicesScan() {
     return true;
   }
