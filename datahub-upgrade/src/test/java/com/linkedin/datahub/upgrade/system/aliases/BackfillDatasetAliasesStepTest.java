@@ -15,7 +15,6 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
-import static org.testng.Assert.assertNotEquals;
 import static org.testng.Assert.assertTrue;
 import static org.testng.Assert.expectThrows;
 
@@ -203,7 +202,7 @@ public class BackfillDatasetAliasesStepTest {
   public void testWritesMissingAndMismatchedSkipsMatched() {
     when(mockAspectDao.streamAspectBatches(
             any(OperationContext.class), any(RestoreIndicesArgs.class)))
-        .thenReturn(page(keyRow(URN_MISSING), keyRow(URN_MATCHED), keyRow(URN_MISMATCHED)), page());
+        .thenReturn(page(keyRow(URN_MISSING), keyRow(URN_MATCHED), keyRow(URN_MISMATCHED)));
     when(mockAspectDao.batchGet(any(OperationContext.class), any(), eq(false)))
         .thenReturn(
             Map.of(
@@ -254,7 +253,7 @@ public class BackfillDatasetAliasesStepTest {
   public void testAllMatchedPerformsNoWrites() {
     when(mockAspectDao.streamAspectBatches(
             any(OperationContext.class), any(RestoreIndicesArgs.class)))
-        .thenReturn(page(keyRow(URN_MATCHED)), page());
+        .thenReturn(page(keyRow(URN_MATCHED)));
     when(mockAspectDao.batchGet(any(OperationContext.class), any(), eq(false)))
         .thenReturn(Map.of(aliasesKey(URN_MATCHED), aliasesRow(URN_MATCHED, URN_MATCHED_LOWER)));
 
@@ -273,14 +272,14 @@ public class BackfillDatasetAliasesStepTest {
     EbeanAspectV2 r3 = keyRow("urn:li:dataset:(urn:li:dataPlatform:mysql,db.c,PROD)");
     when(mockAspectDao.streamAspectBatches(
             any(OperationContext.class), any(RestoreIndicesArgs.class)))
-        .thenReturn(page(r1, r2), page(r3), page());
+        .thenReturn(page(r1, r2), page(r3));
 
     UpgradeStepResult result = buildStep(2, 0, false).executable().apply(mockContext);
     assertEquals(result.result(), DataHubUpgradeState.SUCCEEDED);
 
     ArgumentCaptor<RestoreIndicesArgs> argsCaptor =
         ArgumentCaptor.forClass(RestoreIndicesArgs.class);
-    verify(mockAspectDao, times(3))
+    verify(mockAspectDao, times(2))
         .streamAspectBatches(any(OperationContext.class), argsCaptor.capture());
     List<RestoreIndicesArgs> allArgs = argsCaptor.getAllValues();
 
@@ -291,18 +290,15 @@ public class BackfillDatasetAliasesStepTest {
     assertEquals(allArgs.get(0).batchSize(), 2);
     assertEquals(allArgs.get(0).limit(), 2); // one page per query
     assertEquals(allArgs.get(0).lastUrn(), "");
+    // the scan never filters on createdon; urn is the only cursor
     assertEquals(allArgs.get(0).gePitEpochMs(), 0);
 
     // page 2: strictly-exclusive keyset boundary at page 1's last row
     assertEquals(allArgs.get(1).lastUrn(), "urn:li:dataset:(urn:li:dataPlatform:mysql,db.b,PROD)");
     assertEquals(allArgs.get(1).lastAspect(), DATASET_KEY_ASPECT_NAME);
+    assertEquals(allArgs.get(1).gePitEpochMs(), 0);
 
-    // call 3: tail sweep with BOTH createdon bounds set (le without ge>0 matches nothing)
-    assertTrue(allArgs.get(2).gePitEpochMs() > 0);
-    assertTrue(allArgs.get(2).lePitEpochMs() >= allArgs.get(2).gePitEpochMs());
-    assertEquals(allArgs.get(2).lastUrn(), "");
-
-    // one IN_PROGRESS checkpoint per completed page, carrying lastUrn + scanStartMs
+    // one IN_PROGRESS checkpoint per completed page, carrying lastUrn
     @SuppressWarnings("unchecked")
     ArgumentCaptor<Map<String, String>> checkpointCaptor = ArgumentCaptor.forClass(Map.class);
     verify(mockUpgrade, times(2))
@@ -318,17 +314,10 @@ public class BackfillDatasetAliasesStepTest {
     assertEquals(
         checkpointCaptor.getAllValues().get(1).get(BackfillDatasetAliasesStep.LAST_URN_KEY),
         "urn:li:dataset:(urn:li:dataPlatform:mysql,db.c,PROD)");
-    assertTrue(
-        Long.parseLong(
-                checkpointCaptor
-                    .getAllValues()
-                    .get(0)
-                    .get(BackfillDatasetAliasesStep.SCAN_START_MS_KEY))
-            > 0);
   }
 
   @Test
-  public void testConfigLimitStopsWithoutMarkerOrSweep() {
+  public void testConfigLimitStopsWithoutMarker() {
     EbeanAspectV2 r1 = keyRow("urn:li:dataset:(urn:li:dataPlatform:mysql,db.a,PROD)");
     EbeanAspectV2 r2 = keyRow("urn:li:dataset:(urn:li:dataPlatform:mysql,db.b,PROD)");
     when(mockAspectDao.streamAspectBatches(
@@ -339,7 +328,7 @@ public class BackfillDatasetAliasesStepTest {
     // The STEP result is success (the canary run did what was asked) …
     assertEquals(result.result(), DataHubUpgradeState.SUCCEEDED);
 
-    // … but the run is explicitly partial: checkpoint only, no sweep, and NEVER the marker.
+    // … but the run is explicitly partial: checkpoint only, and NEVER the marker.
     verify(mockAspectDao, times(1))
         .streamAspectBatches(any(OperationContext.class), any(RestoreIndicesArgs.class));
     verify(mockUpgrade, times(1))
@@ -363,14 +352,9 @@ public class BackfillDatasetAliasesStepTest {
   @Test
   public void testResumeRepairReemitsMclForMatchedOnFirstPageOnly() {
     String resumeUrn = "urn:li:dataset:(urn:li:dataPlatform:mysql,db.a,PROD)";
-    long scanStartMs = 1_700_000_000_000L;
     mockPreviousResult(
         DataHubUpgradeState.IN_PROGRESS,
-        Map.of(
-            BackfillDatasetAliasesStep.LAST_URN_KEY,
-            resumeUrn,
-            BackfillDatasetAliasesStep.SCAN_START_MS_KEY,
-            String.valueOf(scanStartMs)));
+        Map.of(BackfillDatasetAliasesStep.LAST_URN_KEY, resumeUrn));
 
     String m1 = "urn:li:dataset:(urn:li:dataPlatform:mysql,db.m1,PROD)";
     String m1Lower = "urn:li:dataset:(urn:li:dataPlatform:mysql,db.m1,PROD)";
@@ -379,10 +363,10 @@ public class BackfillDatasetAliasesStepTest {
     String m3 = "urn:li:dataset:(urn:li:dataPlatform:mysql,db.m3,PROD)";
     String m3Lower = "urn:li:dataset:(urn:li:dataPlatform:mysql,db.m3,PROD)";
 
-    // page 1 (repair window): two matched rows; page 2: one matched row; sweep: empty
+    // page 1 (repair window): two matched rows; page 2: one matched row, ends the scan
     when(mockAspectDao.streamAspectBatches(
             any(OperationContext.class), any(RestoreIndicesArgs.class)))
-        .thenReturn(page(keyRow(m1), keyRow(m2)), page(keyRow(m3)), page());
+        .thenReturn(page(keyRow(m1), keyRow(m2)), page(keyRow(m3)));
     when(mockAspectDao.batchGet(any(OperationContext.class), any(), eq(false)))
         .thenReturn(
             Map.of(
@@ -403,14 +387,6 @@ public class BackfillDatasetAliasesStepTest {
         .streamAspectBatches(any(OperationContext.class), argsCaptor.capture());
     assertEquals(argsCaptor.getAllValues().get(0).lastUrn(), resumeUrn);
     assertEquals(argsCaptor.getAllValues().get(0).lastAspect(), DATASET_KEY_ASPECT_NAME);
-
-    // sweep uses the ORIGINAL run's scanStartMs from the checkpoint, not a fresh one
-    RestoreIndicesArgs sweepArgs =
-        argsCaptor.getAllValues().stream()
-            .filter(a -> a.gePitEpochMs() > 0)
-            .findFirst()
-            .orElseThrow();
-    assertEquals(sweepArgs.gePitEpochMs(), scanStartMs);
 
     // matched rows of the FIRST page after resume get their MCL re-emitted (SQL may have
     // committed while the Kafka produce was lost); later pages are skipped silently.
@@ -435,51 +411,6 @@ public class BackfillDatasetAliasesStepTest {
     assertFalse(reemitted.contains(m3));
   }
 
-  // ── executable: tail sweep ────────────────────────────────────────────────
-
-  @Test
-  public void testTailSweepCatchesLateRowsAndChainsWindows() {
-    String late = "urn:li:dataset:(urn:li:dataPlatform:mysql,db.late,PROD)";
-    // main scan: one matched row (no writes); sweep pass 1: one missing row (write);
-    // sweep pass 2: empty (zero writes → converged → marker)
-    when(mockAspectDao.streamAspectBatches(
-            any(OperationContext.class), any(RestoreIndicesArgs.class)))
-        .thenReturn(page(keyRow(URN_MATCHED)), page(keyRow(late)), page());
-    when(mockAspectDao.batchGet(any(OperationContext.class), any(), eq(false)))
-        .thenReturn(Map.of(aliasesKey(URN_MATCHED), aliasesRow(URN_MATCHED, URN_MATCHED_LOWER)));
-
-    UpgradeStepResult result = buildStep(10, 0, false).executable().apply(mockContext);
-    assertEquals(result.result(), DataHubUpgradeState.SUCCEEDED);
-
-    ArgumentCaptor<RestoreIndicesArgs> argsCaptor =
-        ArgumentCaptor.forClass(RestoreIndicesArgs.class);
-    verify(mockAspectDao, times(3))
-        .streamAspectBatches(any(OperationContext.class), argsCaptor.capture());
-    List<RestoreIndicesArgs> allArgs = argsCaptor.getAllValues();
-
-    // sweep windows chain: pass 2 starts where pass 1 ended
-    RestoreIndicesArgs sweep1 = allArgs.get(1);
-    RestoreIndicesArgs sweep2 = allArgs.get(2);
-    assertTrue(sweep1.gePitEpochMs() > 0);
-    assertTrue(sweep2.gePitEpochMs() > 0);
-    assertEquals(sweep2.gePitEpochMs(), sweep1.lePitEpochMs());
-    assertNotEquals(sweep1.gePitEpochMs(), sweep2.gePitEpochMs());
-
-    // the late row was written
-    ArgumentCaptor<AspectsBatch> batchCaptor = ArgumentCaptor.forClass(AspectsBatch.class);
-    verify(mockEntityService, times(1))
-        .ingestAspects(any(OperationContext.class), batchCaptor.capture(), eq(true), eq(true));
-    assertEquals(batchCaptor.getValue().getMCPItems().get(0).getUrn().toString(), late);
-
-    verify(mockUpgrade)
-        .setUpgradeResult(
-            any(OperationContext.class),
-            any(Urn.class),
-            any(),
-            eq(DataHubUpgradeState.SUCCEEDED),
-            eq(null));
-  }
-
   // ── executable: failure and edge handling ─────────────────────────────────
 
   @Test
@@ -488,7 +419,7 @@ public class BackfillDatasetAliasesStepTest {
     String bad = "urn:li:dataset:(urn:li:dataPlatform:mysql,db.a)";
     when(mockAspectDao.streamAspectBatches(
             any(OperationContext.class), any(RestoreIndicesArgs.class)))
-        .thenReturn(page(keyRow(bad), keyRow(URN_MISSING)), page());
+        .thenReturn(page(keyRow(bad), keyRow(URN_MISSING)));
 
     UpgradeStepResult result = buildStep(10, 0, false).executable().apply(mockContext);
     assertEquals(result.result(), DataHubUpgradeState.SUCCEEDED);

@@ -51,7 +51,6 @@ import java.util.concurrent.Future;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import javax.annotation.Nonnull;
-import javax.annotation.Nullable;
 import lombok.extern.slf4j.Slf4j;
 
 /**
@@ -63,8 +62,13 @@ import lombok.extern.slf4j.Slf4j;
  *
  * <p>The completion marker ({@code dataHubUpgradeResult} state SUCCEEDED on {@code
  * urn:li:dataHubUpgrade:dataset-aliases-v1}) is therefore a correctness signal: it is only written
- * after a full urn-ordered scan reaches natural exhaustion AND a createdon-bounded tail sweep
- * converges to zero writes. Consumers must gate resolution on this marker.
+ * once the urn-ordered scan reaches natural exhaustion, never off a row count and never when a
+ * configured limit truncated the scan. Consumers must gate resolution on this marker.
+ *
+ * <p>The marker's promise is point-in-time: datasets created after the scan passed their urn
+ * position are covered by the side effect instead. A deployment whose write path still runs an
+ * older image without the side effect can therefore leave gaps; {@code
+ * systemUpdate.datasetAliases.reprocess.enabled} forces a full re-scan and repair for that case.
  */
 @Slf4j
 public class BackfillDatasetAliasesStep implements UpgradeStep {
@@ -77,12 +81,6 @@ public class BackfillDatasetAliasesStep implements UpgradeStep {
 
   /** Checkpoint key: urn boundary of the last fully confirmed page. */
   public static final String LAST_URN_KEY = "lastUrn";
-
-  /**
-   * Checkpoint key: epoch-ms instant the ORIGINAL run's scan started. Preserved across resumes so
-   * the tail sweep always covers every moment any part of this logical run was scanning.
-   */
-  public static final String SCAN_START_MS_KEY = "scanStartMs";
 
   private static final String DATASET_URN_LIKE = "urn:li:" + DATASET_ENTITY_NAME + ":%";
 
@@ -187,26 +185,18 @@ public class BackfillDatasetAliasesStep implements UpgradeStep {
 
       String lastUrn = resumeState.map(state -> state.get(LAST_URN_KEY)).orElse("");
       boolean resuming = !lastUrn.isEmpty();
-      // Keep the ORIGINAL run's scan start across resumes: rows created behind the cursor at any
-      // point of this logical run must fall inside the sweep window. Missing key (malformed
-      // state) degrades to 0 == unbounded sweep — expensive but still correct.
-      long scanStartMs =
-          resumeState
-              .map(state -> state.get(SCAN_START_MS_KEY))
-              .map(Long::parseLong)
-              .orElse(System.currentTimeMillis());
       if (resuming) {
         log.info("{}: Resuming from URN: {}", getUpgradeIdUrn(), lastUrn);
       }
 
       RunStats stats = new RunStats();
 
-      // Phase 1: urn-ordered keyset scan, one short-lived query per page.
+      // urn-ordered keyset scan, one short-lived query per page.
       boolean repairPage = resuming;
       long totalRows = 0;
       boolean stoppedByLimit = false;
       while (true) {
-        List<EbeanAspectV2> page = fetchPage(context.opContext(), lastUrn, null, null);
+        List<EbeanAspectV2> page = fetchPage(context.opContext(), lastUrn);
         if (page.isEmpty()) {
           break;
         }
@@ -214,7 +204,7 @@ public class BackfillDatasetAliasesStep implements UpgradeStep {
         repairPage = false;
         totalRows += page.size();
         lastUrn = page.get(page.size() - 1).getUrn();
-        saveCheckpoint(context, lastUrn, scanStartMs);
+        saveCheckpoint(context, lastUrn);
         if (limit > 0 && totalRows >= limit) {
           stoppedByLimit = true;
           break;
@@ -242,41 +232,11 @@ public class BackfillDatasetAliasesStep implements UpgradeStep {
         return new DefaultUpgradeStepResult(id(), DataHubUpgradeState.SUCCEEDED);
       }
 
-      // Phase 2: tail sweep over rows created while the scan was running. A pod that predates
-      // this deployment (rolling upgrade) may still create datasets without the side effect, and
-      // rows inserted behind the cursor are never seen by phase 1. Chain createdon windows until
-      // a sweep writes nothing.
-      boolean repairSweep = resuming;
-      long sweepFromMs = scanStartMs;
-      while (true) {
-        // strictly advancing upper bound keeps windows non-degenerate even within one ms
-        long sweepToMs = Math.max(System.currentTimeMillis(), sweepFromMs + 1);
-        long writesBefore = stats.written;
-        String sweepLastUrn = "";
-        while (true) {
-          List<EbeanAspectV2> page =
-              fetchPage(context.opContext(), sweepLastUrn, sweepFromMs, sweepToMs);
-          if (page.isEmpty()) {
-            break;
-          }
-          processPage(page, repairSweep, stats);
-          sweepLastUrn = page.get(page.size() - 1).getUrn();
-          if (page.size() < batchSize) {
-            break;
-          }
-          sleep();
-        }
-        repairSweep = false;
-        if (stats.written == writesBefore) {
-          break;
-        }
-        sweepFromMs = sweepToMs;
-        sleep();
-      }
-
-      // Total coverage established: every dataset key row either carried a matching value,
-      // had one committed + MCL-confirmed this run, or is unparseable (invisible to the side
-      // effect and the resolver alike).
+      // Scan exhausted: every dataset key row present during the scan either carried a matching
+      // value, had one committed + MCL-confirmed this run, or is unparseable (invisible to the
+      // side effect and the resolver alike). Datasets created after the scan passed their urn
+      // position rely on AliasesSideEffect; a deployment that creates datasets from pods still
+      // running an older image can miss those, and the remedy is a reprocess run.
       context
           .upgrade()
           .setUpgradeResult(
@@ -294,8 +254,7 @@ public class BackfillDatasetAliasesStep implements UpgradeStep {
    * makes the boundary strictly exclusive: for {@code urn == lastUrn} the predicate demands {@code
    * aspect > 'datasetKey'}, which the aspect filter forbids.
    */
-  private List<EbeanAspectV2> fetchPage(
-      OperationContext scanOpContext, String lastUrn, @Nullable Long geMs, @Nullable Long leMs) {
+  private List<EbeanAspectV2> fetchPage(OperationContext scanOpContext, String lastUrn) {
     RestoreIndicesArgs args =
         new RestoreIndicesArgs()
             .aspectName(DATASET_KEY_ASPECT_NAME)
@@ -305,11 +264,6 @@ public class BackfillDatasetAliasesStep implements UpgradeStep {
             .urnBasedPagination(true)
             .lastUrn(lastUrn)
             .lastAspect(lastUrn.isEmpty() ? "" : DATASET_KEY_ASPECT_NAME);
-    if (geMs != null) {
-      // both bounds always: the le filter only applies when ge > 0, and an unset le field
-      // defaults to 0 which would silently match nothing
-      args = args.gePitEpochMs(geMs).lePitEpochMs(leMs);
-    }
     try (PartitionedStream<EbeanAspectV2> stream =
         aspectDao.streamAspectBatches(scanOpContext, args)) {
       return stream.partition(batchSize).flatMap(Function.identity()).collect(Collectors.toList());
@@ -431,7 +385,7 @@ public class BackfillDatasetAliasesStep implements UpgradeStep {
     }
   }
 
-  private void saveCheckpoint(UpgradeContext context, String lastUrn, long scanStartMs) {
+  private void saveCheckpoint(UpgradeContext context, String lastUrn) {
     log.info("{}: Saving state. Last urn:{}", getUpgradeIdUrn(), lastUrn);
     context
         .upgrade()
@@ -440,7 +394,7 @@ public class BackfillDatasetAliasesStep implements UpgradeStep {
             getUpgradeIdUrn(),
             entityService,
             DataHubUpgradeState.IN_PROGRESS,
-            Map.of(LAST_URN_KEY, lastUrn, SCAN_START_MS_KEY, String.valueOf(scanStartMs)));
+            Map.of(LAST_URN_KEY, lastUrn));
   }
 
   private SystemMetadata backfillSystemMetadata() {
