@@ -293,12 +293,15 @@ public class BackfillDatasetAliasesStepTest {
     // the scan never filters on createdon; urn is the only cursor
     assertEquals(allArgs.get(0).gePitEpochMs(), 0);
 
-    // page 2: strictly-exclusive keyset boundary at page 1's last row
+    // page 2 resumes at page 1's last row, inclusively. lastAspect stays unset on purpose: it is
+    // what would make the boundary exclusive, and its urn != lastUrn term is collation-sensitive,
+    // dropping urns that differ from the boundary only by case.
     assertEquals(allArgs.get(1).lastUrn(), "urn:li:dataset:(urn:li:dataPlatform:mysql,db.b,PROD)");
-    assertEquals(allArgs.get(1).lastAspect(), DATASET_KEY_ASPECT_NAME);
+    assertEquals(allArgs.get(1).lastAspect(), "");
     assertEquals(allArgs.get(1).gePitEpochMs(), 0);
 
-    // one IN_PROGRESS checkpoint per completed page, carrying lastUrn
+    // One IN_PROGRESS checkpoint per page, taken BEFORE that page is written: the confirmed
+    // boundary lags one page behind the attempted one, so a crash mid-page re-reads it in full.
     @SuppressWarnings("unchecked")
     ArgumentCaptor<Map<String, String>> checkpointCaptor = ArgumentCaptor.forClass(Map.class);
     verify(mockUpgrade, times(2))
@@ -308,11 +311,17 @@ public class BackfillDatasetAliasesStepTest {
             any(),
             eq(DataHubUpgradeState.IN_PROGRESS),
             checkpointCaptor.capture());
+    Map<String, String> firstCheckpoint = checkpointCaptor.getAllValues().get(0);
+    assertEquals(firstCheckpoint.get(BackfillDatasetAliasesStep.LAST_URN_KEY), "");
     assertEquals(
-        checkpointCaptor.getAllValues().get(0).get(BackfillDatasetAliasesStep.LAST_URN_KEY),
+        firstCheckpoint.get(BackfillDatasetAliasesStep.ATTEMPTED_URN_KEY),
+        "urn:li:dataset:(urn:li:dataPlatform:mysql,db.b,PROD)");
+    Map<String, String> secondCheckpoint = checkpointCaptor.getAllValues().get(1);
+    assertEquals(
+        secondCheckpoint.get(BackfillDatasetAliasesStep.LAST_URN_KEY),
         "urn:li:dataset:(urn:li:dataPlatform:mysql,db.b,PROD)");
     assertEquals(
-        checkpointCaptor.getAllValues().get(1).get(BackfillDatasetAliasesStep.LAST_URN_KEY),
+        secondCheckpoint.get(BackfillDatasetAliasesStep.ATTEMPTED_URN_KEY),
         "urn:li:dataset:(urn:li:dataPlatform:mysql,db.c,PROD)");
   }
 
@@ -331,13 +340,22 @@ public class BackfillDatasetAliasesStepTest {
     // … but the run is explicitly partial: checkpoint only, and NEVER the marker.
     verify(mockAspectDao, times(1))
         .streamAspectBatches(any(OperationContext.class), any(RestoreIndicesArgs.class));
-    verify(mockUpgrade, times(1))
+    @SuppressWarnings("unchecked")
+    ArgumentCaptor<Map<String, String>> checkpointCaptor = ArgumentCaptor.forClass(Map.class);
+    verify(mockUpgrade, times(2))
         .setUpgradeResult(
             any(OperationContext.class),
             any(Urn.class),
             any(),
             eq(DataHubUpgradeState.IN_PROGRESS),
-            any());
+            checkpointCaptor.capture());
+    // The handoff to the next run confirms the page and closes the repair window, so a resume
+    // after a capped run does no needless re-emission.
+    Map<String, String> handoff = checkpointCaptor.getAllValues().get(1);
+    assertEquals(
+        handoff.get(BackfillDatasetAliasesStep.LAST_URN_KEY),
+        "urn:li:dataset:(urn:li:dataPlatform:mysql,db.b,PROD)");
+    assertEquals(handoff.get(BackfillDatasetAliasesStep.ATTEMPTED_URN_KEY), "");
     verify(mockUpgrade, never())
         .setUpgradeResult(
             any(OperationContext.class),
@@ -349,49 +367,10 @@ public class BackfillDatasetAliasesStepTest {
 
   // ── executable: resume + lost-MCL repair ──────────────────────────────────
 
-  @Test
-  public void testResumeRepairReemitsMclForMatchedOnFirstPageOnly() {
-    String resumeUrn = "urn:li:dataset:(urn:li:dataPlatform:mysql,db.a,PROD)";
-    mockPreviousResult(
-        DataHubUpgradeState.IN_PROGRESS,
-        Map.of(BackfillDatasetAliasesStep.LAST_URN_KEY, resumeUrn));
-
-    String m1 = "urn:li:dataset:(urn:li:dataPlatform:mysql,db.m1,PROD)";
-    String m1Lower = "urn:li:dataset:(urn:li:dataPlatform:mysql,db.m1,PROD)";
-    String m2 = "urn:li:dataset:(urn:li:dataPlatform:mysql,db.m2,PROD)";
-    String m2Lower = "urn:li:dataset:(urn:li:dataPlatform:mysql,db.m2,PROD)";
-    String m3 = "urn:li:dataset:(urn:li:dataPlatform:mysql,db.m3,PROD)";
-    String m3Lower = "urn:li:dataset:(urn:li:dataPlatform:mysql,db.m3,PROD)";
-
-    // page 1 (repair window): two matched rows; page 2: one matched row, ends the scan
-    when(mockAspectDao.streamAspectBatches(
-            any(OperationContext.class), any(RestoreIndicesArgs.class)))
-        .thenReturn(page(keyRow(m1), keyRow(m2)), page(keyRow(m3)));
-    when(mockAspectDao.batchGet(any(OperationContext.class), any(), eq(false)))
-        .thenReturn(
-            Map.of(
-                aliasesKey(m1), aliasesRow(m1, m1Lower),
-                aliasesKey(m2), aliasesRow(m2, m2Lower),
-                aliasesKey(m3), aliasesRow(m3, m3Lower)));
-    when(mockEntityService.alwaysProduceMCLAsync(
-            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()))
-        .thenReturn(Pair.of(CompletableFuture.completedFuture(null), true));
-
-    UpgradeStepResult result = buildStep(2, 0, false).executable().apply(mockContext);
-    assertEquals(result.result(), DataHubUpgradeState.SUCCEEDED);
-
-    // resume boundary honored
-    ArgumentCaptor<RestoreIndicesArgs> argsCaptor =
-        ArgumentCaptor.forClass(RestoreIndicesArgs.class);
-    verify(mockAspectDao, atLeastOnce())
-        .streamAspectBatches(any(OperationContext.class), argsCaptor.capture());
-    assertEquals(argsCaptor.getAllValues().get(0).lastUrn(), resumeUrn);
-    assertEquals(argsCaptor.getAllValues().get(0).lastAspect(), DATASET_KEY_ASPECT_NAME);
-
-    // matched rows of the FIRST page after resume get their MCL re-emitted (SQL may have
-    // committed while the Kafka produce was lost); later pages are skipped silently.
+  /** urns of every matched row whose MCL was unconditionally re-emitted. */
+  private List<String> captureReemittedUrns(int expectedCount) {
     ArgumentCaptor<Urn> urnCaptor = ArgumentCaptor.forClass(Urn.class);
-    verify(mockEntityService, times(2))
+    verify(mockEntityService, times(expectedCount))
         .alwaysProduceMCLAsync(
             any(OperationContext.class),
             urnCaptor.capture(),
@@ -404,11 +383,108 @@ public class BackfillDatasetAliasesStepTest {
             any(),
             any(),
             any());
-    List<String> reemitted =
-        urnCaptor.getAllValues().stream().map(Urn::toString).collect(Collectors.toList());
+    return urnCaptor.getAllValues().stream().map(Urn::toString).collect(Collectors.toList());
+  }
+
+  @Test
+  public void testResumeReemitsMclThroughAttemptedBoundaryThenStops() {
+    String confirmedUrn = "urn:li:dataset:(urn:li:dataPlatform:mysql,db.a,PROD)";
+    String m1 = "urn:li:dataset:(urn:li:dataPlatform:mysql,db.m1,PROD)";
+    String m2 = "urn:li:dataset:(urn:li:dataPlatform:mysql,db.m2,PROD)";
+    String m3 = "urn:li:dataset:(urn:li:dataPlatform:mysql,db.m3,PROD)";
+
+    // The dead run committed through m2 without confirming its MCLs.
+    mockPreviousResult(
+        DataHubUpgradeState.IN_PROGRESS,
+        Map.of(
+            BackfillDatasetAliasesStep.LAST_URN_KEY, confirmedUrn,
+            BackfillDatasetAliasesStep.ATTEMPTED_URN_KEY, m2));
+
+    when(mockAspectDao.streamAspectBatches(
+            any(OperationContext.class), any(RestoreIndicesArgs.class)))
+        .thenReturn(page(keyRow(m1), keyRow(m2)), page(keyRow(m3)));
+    when(mockAspectDao.batchGet(any(OperationContext.class), any(), eq(false)))
+        .thenReturn(
+            Map.of(
+                aliasesKey(m1), aliasesRow(m1, m1),
+                aliasesKey(m2), aliasesRow(m2, m2),
+                aliasesKey(m3), aliasesRow(m3, m3)));
+    when(mockEntityService.alwaysProduceMCLAsync(
+            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()))
+        .thenReturn(Pair.of(CompletableFuture.completedFuture(null), true));
+
+    UpgradeStepResult result = buildStep(2, 0, false).executable().apply(mockContext);
+    assertEquals(result.result(), DataHubUpgradeState.SUCCEEDED);
+
+    // the scan restarts from the confirmed boundary, not the attempted one
+    ArgumentCaptor<RestoreIndicesArgs> argsCaptor =
+        ArgumentCaptor.forClass(RestoreIndicesArgs.class);
+    verify(mockAspectDao, atLeastOnce())
+        .streamAspectBatches(any(OperationContext.class), argsCaptor.capture());
+    assertEquals(argsCaptor.getAllValues().get(0).lastUrn(), confirmedUrn);
+    assertEquals(argsCaptor.getAllValues().get(0).lastAspect(), "");
+
+    // m1/m2 sit in the unconfirmed window, so their stored value proves nothing about ES; m3 is
+    // past it and a matched row there is trustworthy, so it stays a silent skip.
+    List<String> reemitted = captureReemittedUrns(2);
     assertTrue(reemitted.contains(m1));
     assertTrue(reemitted.contains(m2));
     assertFalse(reemitted.contains(m3));
+  }
+
+  @Test
+  public void testResumeRepairSpansPagesWhenNewDatasetsShiftTheBoundary() {
+    // Regression: deriving the repair window from the page shape ("re-emit the first page after a
+    // resume") silently loses rows. The dead run committed through m3; datasets created inside that
+    // urn range since then push m3 onto a later page, and it is already matched in SQL with no MCL
+    // ever produced — skipping it is a permanent Elasticsearch gap the marker would not reflect.
+    String confirmedUrn = "urn:li:dataset:(urn:li:dataPlatform:mysql,db.a,PROD)";
+    String m1 = "urn:li:dataset:(urn:li:dataPlatform:mysql,db.m1,PROD)";
+    String newA = "urn:li:dataset:(urn:li:dataPlatform:mysql,db.m1a,PROD)";
+    String newB = "urn:li:dataset:(urn:li:dataPlatform:mysql,db.m1b,PROD)";
+    String m3 = "urn:li:dataset:(urn:li:dataPlatform:mysql,db.m3,PROD)";
+    String beyond1 = "urn:li:dataset:(urn:li:dataPlatform:mysql,db.m4,PROD)";
+    String beyond2 = "urn:li:dataset:(urn:li:dataPlatform:mysql,db.m5,PROD)";
+
+    mockPreviousResult(
+        DataHubUpgradeState.IN_PROGRESS,
+        Map.of(
+            BackfillDatasetAliasesStep.LAST_URN_KEY, confirmedUrn,
+            BackfillDatasetAliasesStep.ATTEMPTED_URN_KEY, m3));
+
+    when(mockAspectDao.streamAspectBatches(
+            any(OperationContext.class), any(RestoreIndicesArgs.class)))
+        .thenReturn(
+            page(keyRow(m1), keyRow(newA)),
+            page(keyRow(newB), keyRow(m3)),
+            page(keyRow(beyond1), keyRow(beyond2)),
+            page());
+    when(mockAspectDao.batchGet(any(OperationContext.class), any(), eq(false)))
+        .thenReturn(
+            Map.of(
+                aliasesKey(m1), aliasesRow(m1, m1),
+                aliasesKey(m3), aliasesRow(m3, m3),
+                aliasesKey(beyond1), aliasesRow(beyond1, beyond1),
+                aliasesKey(beyond2), aliasesRow(beyond2, beyond2)));
+    when(mockEntityService.alwaysProduceMCLAsync(
+            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()))
+        .thenReturn(Pair.of(CompletableFuture.completedFuture(null), true));
+
+    UpgradeStepResult result = buildStep(2, 0, false).executable().apply(mockContext);
+    assertEquals(result.result(), DataHubUpgradeState.SUCCEEDED);
+
+    // m3 is re-emitted even though it landed on the SECOND page of the resumed scan — the whole
+    // point of persisting the boundary rather than inferring it.
+    List<String> reemitted = captureReemittedUrns(2);
+    assertTrue(reemitted.contains(m1));
+    assertTrue(reemitted.contains(m3));
+    // The window closes at the boundary: matched rows past it are trustworthy and stay silent
+    // skips, so a resume does not degenerate into re-emitting the whole table.
+    assertFalse(reemitted.contains(beyond1));
+    assertFalse(reemitted.contains(beyond2));
+    // newA/newB had no stored aspect at all, so they take the ordinary write path.
+    assertFalse(reemitted.contains(newA));
+    assertFalse(reemitted.contains(newB));
   }
 
   // ── executable: failure and edge handling ─────────────────────────────────
@@ -440,7 +516,53 @@ public class BackfillDatasetAliasesStepTest {
   }
 
   @Test
-  public void testMclFailureFailsRunBeforeCheckpoint() {
+  public void testStalledCursorFailsInsteadOfSpinningOrClaimingCoverage() {
+    // The inclusive boundary re-reads lastUrn, so a full page that ends where it began proves the
+    // cursor is stuck — here forced with batchSize=1, but the real trigger is more collation-equal
+    // urns than fit in one page. Looping forever is bad; writing the marker would be worse.
+    String stuck = "urn:li:dataset:(urn:li:dataPlatform:mysql,db.a,PROD)";
+    when(mockAspectDao.streamAspectBatches(
+            any(OperationContext.class), any(RestoreIndicesArgs.class)))
+        .thenReturn(page(keyRow(stuck)), page(keyRow(stuck)));
+
+    IllegalStateException e =
+        expectThrows(
+            IllegalStateException.class,
+            () -> buildStep(1, 0, false).executable().apply(mockContext));
+    assertTrue(e.getMessage().contains(stuck));
+
+    verify(mockUpgrade, never())
+        .setUpgradeResult(
+            any(OperationContext.class),
+            any(Urn.class),
+            any(),
+            eq(DataHubUpgradeState.SUCCEEDED),
+            any());
+  }
+
+  @Test
+  public void testFinalPageOfTiedRowsEndsScanCleanly() {
+    // Same shape, benign cause: the page ends at the boundary but is SHORT, so the store had room
+    // to return anything after it and did not. The scan is genuinely exhausted, not stuck.
+    String a = "urn:li:dataset:(urn:li:dataPlatform:mysql,db.a,PROD)";
+    String b = "urn:li:dataset:(urn:li:dataPlatform:mysql,db.b,PROD)";
+    when(mockAspectDao.streamAspectBatches(
+            any(OperationContext.class), any(RestoreIndicesArgs.class)))
+        .thenReturn(page(keyRow(a), keyRow(b)), page(keyRow(b)));
+
+    UpgradeStepResult result = buildStep(2, 0, false).executable().apply(mockContext);
+    assertEquals(result.result(), DataHubUpgradeState.SUCCEEDED);
+    verify(mockUpgrade)
+        .setUpgradeResult(
+            any(OperationContext.class),
+            any(Urn.class),
+            any(),
+            eq(DataHubUpgradeState.SUCCEEDED),
+            eq(null));
+  }
+
+  @Test
+  public void testMclFailureLeavesAttemptedWindowAndNoMarker() {
     when(mockAspectDao.streamAspectBatches(
             any(OperationContext.class), any(RestoreIndicesArgs.class)))
         .thenReturn(page(keyRow(URN_MISSING)));
@@ -456,9 +578,28 @@ public class BackfillDatasetAliasesStepTest {
     expectThrows(
         RuntimeException.class, () -> buildStep(10, 0, false).executable().apply(mockContext));
 
-    // MCL durability unconfirmed → the page's checkpoint must not have been written,
-    // and no marker either.
+    // The SQL write may have committed while the produce failed, so the run must leave behind the
+    // attempted window — the confirmed boundary stays put, and the next run re-emits across it.
+    @SuppressWarnings("unchecked")
+    ArgumentCaptor<Map<String, String>> checkpointCaptor = ArgumentCaptor.forClass(Map.class);
+    verify(mockUpgrade, times(1))
+        .setUpgradeResult(
+            any(OperationContext.class),
+            any(Urn.class),
+            any(),
+            eq(DataHubUpgradeState.IN_PROGRESS),
+            checkpointCaptor.capture());
+    assertEquals(checkpointCaptor.getValue().get(BackfillDatasetAliasesStep.LAST_URN_KEY), "");
+    assertEquals(
+        checkpointCaptor.getValue().get(BackfillDatasetAliasesStep.ATTEMPTED_URN_KEY), URN_MISSING);
+
+    // and never a completion marker off a failed page
     verify(mockUpgrade, never())
-        .setUpgradeResult(any(OperationContext.class), any(Urn.class), any(), any(), any());
+        .setUpgradeResult(
+            any(OperationContext.class),
+            any(Urn.class),
+            any(),
+            eq(DataHubUpgradeState.SUCCEEDED),
+            any());
   }
 }
