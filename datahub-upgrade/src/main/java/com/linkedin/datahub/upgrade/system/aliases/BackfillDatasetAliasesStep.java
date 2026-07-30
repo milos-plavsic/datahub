@@ -53,7 +53,6 @@ import java.util.concurrent.Future;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import javax.annotation.Nonnull;
-import javax.annotation.Nullable;
 import lombok.extern.slf4j.Slf4j;
 
 /**
@@ -306,7 +305,21 @@ public class BackfillDatasetAliasesStep implements UpgradeStep {
           existing.get(
               new EntityAspectIdentifier(rawUrn, ALIASES_ASPECT_NAME, ASPECT_LATEST_VERSION));
 
-      Aliases storedAliases = parseStoredAliases(stored, rawUrn);
+      Aliases storedAliases = null;
+      if (stored != null && stored.getMetadata() != null) {
+        try {
+          storedAliases = RecordUtils.toRecordTemplate(Aliases.class, stored.getMetadata());
+        } catch (ModelConversionException e) {
+          // An unreadable row also breaks the ingest path's own read-before-write, so no upsert
+          // can fix it while it exists: delete it, then write the correct value fresh.
+          log.warn("{}: deleting unreadable stored aliases for {} and rewriting", id(), rawUrn);
+          aspectDao.deleteAspect(
+              opContext,
+              parseUrnUnchecked(rawUrn),
+              ALIASES_ASPECT_NAME,
+              (long) ASPECT_LATEST_VERSION);
+        }
+      }
       boolean matched =
           storedAliases != null
               && storedAliases.hasLowercasedUrn()
@@ -386,20 +399,6 @@ public class BackfillDatasetAliasesStep implements UpgradeStep {
       } catch (ExecutionException e) {
         throw new RuntimeException(String.format("%s: MCL production not confirmed", id()), e);
       }
-    }
-  }
-
-  /** Corrupt stored JSON is treated as missing, so the row is rewritten with the correct value. */
-  @Nullable
-  private Aliases parseStoredAliases(@Nullable EntityAspect stored, String urn) {
-    if (stored == null || stored.getMetadata() == null) {
-      return null;
-    }
-    try {
-      return RecordUtils.toRecordTemplate(Aliases.class, stored.getMetadata());
-    } catch (ModelConversionException e) {
-      log.warn("{}: rewriting unreadable stored aliases for {}", id(), urn);
-      return null;
     }
   }
 

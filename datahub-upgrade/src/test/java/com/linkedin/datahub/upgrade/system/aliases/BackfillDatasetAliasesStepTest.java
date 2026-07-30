@@ -422,8 +422,9 @@ public class BackfillDatasetAliasesStepTest {
   }
 
   @Test
-  public void testCorruptStoredAliasesIsRewrittenNotStuck() {
-    // an unreadable stored row must be rewritten, not fail the page on every retry forever
+  public void testCorruptStoredAliasesIsDeletedAndRewrittenNotStuck() {
+    // An unreadable stored row also breaks the ingest path's read-before-write, so the step must
+    // delete it and write fresh — not fail the page on every retry forever.
     when(mockAspectDao.streamAspectBatches(
             any(OperationContext.class), any(RestoreIndicesArgs.class)))
         .thenReturn(page(keyRow(URN_MATCHED)));
@@ -440,6 +441,12 @@ public class BackfillDatasetAliasesStepTest {
     UpgradeStepResult result = buildStep(10, 0, false).executable().apply(mockContext);
     assertEquals(result.result(), DataHubUpgradeState.SUCCEEDED);
 
+    verify(mockAspectDao)
+        .deleteAspect(
+            any(OperationContext.class),
+            eq(UrnUtils.getUrn(URN_MATCHED)),
+            eq(ALIASES_ASPECT_NAME),
+            eq((long) ASPECT_LATEST_VERSION));
     ArgumentCaptor<AspectsBatch> batchCaptor = ArgumentCaptor.forClass(AspectsBatch.class);
     verify(mockEntityService, times(1))
         .ingestAspects(any(OperationContext.class), batchCaptor.capture(), eq(true), eq(true));
