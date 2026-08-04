@@ -111,7 +111,7 @@ public abstract class SearchLineageFixtureConfiguration {
         .setSideEffects(new MetadataChangeProposalConfig.SideEffectsConfig());
     conf.getMetadataChangeProposal()
         .getSideEffects()
-        .setSchemaField(new MetadataChangeProposalConfig.SideEffectConfig());
+        .setSchemaField(new MetadataChangeProposalConfig.SchemaFieldSideEffectsConfig());
     conf.getMetadataChangeProposal().getSideEffects().getSchemaField().setEnabled(false);
     conf.setElasticSearch(getElasticSearchConfiguration());
     return conf;
