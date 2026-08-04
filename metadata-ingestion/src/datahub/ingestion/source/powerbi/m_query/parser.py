@@ -1,4 +1,5 @@
 import logging
+import re
 from typing import Dict, List, Optional
 
 from datahub.ingestion.api.common import PipelineContext
@@ -10,6 +11,7 @@ from datahub.ingestion.source.powerbi.dataplatform_instance_resolver import (
     AbstractDataPlatformInstanceResolver,
 )
 from datahub.ingestion.source.powerbi.m_query import (
+    dax_resolver,
     pattern_handler,
     resolver as mquery_resolver,
 )
@@ -27,6 +29,10 @@ from datahub.ingestion.source.powerbi.rest_api_wrapper.data_classes import Table
 from datahub.utilities.threading_timeout import TimeoutException, threading_timeout
 
 logger = logging.getLogger(__name__)
+
+# `let` as a whole word — the M-Query keyword. A substring check would misfire on
+# names like "Outlet" or "Complete" that merely contain the letters "let".
+_M_LET_KEYWORD = re.compile(r"\blet\b", re.IGNORECASE)
 
 
 def _parse_with_bridge(expression: str, timeout: int) -> Dict[int, dict]:
@@ -108,27 +114,40 @@ def get_upstream_tables(
         )
         return []
     except MQueryParseError as e:
-        # Expressions without a `let` keyword are almost certainly not M-Query
-        # (e.g. DAX computed-table expressions like SUMMARIZE(...)). The old
-        # Lark parser happened to parse these and then logged INFO "Non-Data
-        # Platform Expression". Preserve that behaviour: only warn when the
-        # expression looks like it was intended to be M-Query.
-        if "let" not in expression.lower():
-            reporter.m_query_non_mquery_expressions += 1
-            logger.info(
-                "Non-M-Query expression in table %s — skipping lineage extraction "
-                "(expression does not contain 'let'). Expression: %s. Error: %s",
-                table.full_name,
-                expression,
-                e,
-            )
-        else:
+        # A failed M parse is often a DAX calculated-table expression (DAX is not
+        # M-Query, e.g. summarize('T', ...)). Try extracting sibling-table
+        # references from it regardless of the M-vs-DAX heuristic below; the
+        # mapper validates the names against the dataset's actual tables.
+        table_refs = dax_resolver.extract_dax_table_references(expression)
+        if table_refs:
+            reporter.m_query_dax_table_lineage += 1
+            return [
+                Lineage(
+                    upstreams=[],
+                    column_lineage=[],
+                    powerbi_table_upstreams=table_refs,
+                )
+            ]
+
+        # No table references. An expression without the `let` keyword is almost
+        # certainly not M-Query (the old Lark parser logged INFO "Non-Data
+        # Platform Expression" for these); only warn when it looks like M-Query.
+        if _M_LET_KEYWORD.search(expression):
             reporter.m_query_parse_unknown_errors += 1
             reporter.warning(
                 title="Unable to parse M-Query expression",
                 message="Got a parse error while parsing the expression. Lineage will be missing for this table.",
                 context=f"table-full-name={table.full_name}, expression={expression}",
                 exc=e,
+            )
+        else:
+            reporter.m_query_non_mquery_expressions += 1
+            logger.info(
+                "Non-M-Query expression in table %s — skipping lineage extraction "
+                "(no 'let' keyword). Expression: %s. Error: %s",
+                table.full_name,
+                expression,
+                e,
             )
         return []
     except MQueryBridgeError as e:
